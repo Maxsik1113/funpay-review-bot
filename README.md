@@ -39,6 +39,7 @@ DRY_RUN=true
 SEND_REVIEW_IMAGE=false
 DATA_DIR=/app/data
 POLL_DELAY=6
+AUTH_RETRY_DELAY=900
 ```
 
 С `DRY_RUN=true` бот только пишет обнаруженную покупку в лог. Для реальной выдачи поставьте `DRY_RUN=false` и выполните новый деплой.

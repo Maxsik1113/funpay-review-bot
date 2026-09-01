@@ -10,11 +10,12 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
-from FunPayAPI import Account, Runner, enums
+from FunPayAPI import Account, Runner, enums, exceptions
 
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 POLL_DELAY = max(3.0, float(os.getenv("POLL_DELAY", "6")))
+AUTH_RETRY_DELAY = max(60.0, float(os.getenv("AUTH_RETRY_DELAY", "900")))
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes", "on"}
 DOWNLOAD_URL = os.getenv("DOWNLOAD_URL", "").strip()
 PRODUCTS_JSON = os.getenv("PRODUCTS_JSON", "").strip()
@@ -462,6 +463,14 @@ def main() -> None:
         except KeyboardInterrupt:
             logger.info("Бот остановлен")
             return
+        except exceptions.UnauthorizedError:
+            logger.error(
+                "Авторизация FunPay отклонена: FUNPAY_GOLDEN_KEY недействителен "
+                "или истёк. Обновите ключ в Bothost и перезапустите бота. "
+                "Следующая автоматическая попытка через %.0f минут.",
+                AUTH_RETRY_DELAY / 60,
+            )
+            time.sleep(AUTH_RETRY_DELAY)
         except Exception:
             logger.exception("Бот остановился с ошибкой; повторный запуск через 30 секунд")
             time.sleep(30)
