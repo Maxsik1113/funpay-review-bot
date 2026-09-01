@@ -20,6 +20,8 @@ SEND_REVIEW_IMAGE = os.getenv("SEND_REVIEW_IMAGE", "true").lower() in {
     "yes",
     "on",
 }
+TEST_ALLOWED_USER = os.getenv("TEST_ALLOWED_USER", "").strip()
+TEST_COMMAND = os.getenv("TEST_COMMAND", "").strip()
 
 ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = Path("/app/data") if Path("/app").exists() else ROOT_DIR / "data"
@@ -41,6 +43,10 @@ DEFAULT_REVIEW_MESSAGE = """⭐ {buyer}, спасибо за подтвержд�
 Если покупка вам понравилась, буду благодарен за честный отзыв 😊
 Оставить его можно на странице заказа:
 https://funpay.com/orders/{order_id}/"""
+
+TEST_REPLY_MESSAGE = """✅ {buyer}, тестовая команда получена.
+
+Бот видит входящие сообщения и умеет отвечать. Автовыдача, ссылка на товар и запрос отзыва не запускались."""
 
 
 logging.basicConfig(
@@ -68,6 +74,16 @@ def init_database() -> sqlite3.Connection:
             event_name TEXT NOT NULL,
             buyer TEXT NOT NULL,
             processed_at INTEGER NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS processed_test_messages (
+            message_id INTEGER NOT NULL,
+            chat_id TEXT NOT NULL,
+            processed_at INTEGER NOT NULL,
+            PRIMARY KEY (message_id, chat_id)
         )
         """
     )
@@ -100,6 +116,33 @@ def mark_processed(
     connection.commit()
 
 
+def was_test_message_processed(
+    connection: sqlite3.Connection, message_id: int, chat_id: int | str
+) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1 FROM processed_test_messages
+        WHERE message_id = ? AND chat_id = ?
+        """,
+        (message_id, str(chat_id)),
+    ).fetchone()
+    return row is not None
+
+
+def mark_test_message_processed(
+    connection: sqlite3.Connection, message_id: int, chat_id: int | str
+) -> None:
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO processed_test_messages
+            (message_id, chat_id, processed_at)
+        VALUES (?, ?, ?)
+        """,
+        (message_id, str(chat_id), int(time.time())),
+    )
+    connection.commit()
+
+
 def extract_order_id(text: str | None) -> str | None:
     if not text:
         return None
@@ -122,6 +165,29 @@ def send_with_retries(action_name: str, action, attempts: int = 3) -> None:
             if attempt < attempts:
                 time.sleep(5 * attempt)
     raise RuntimeError(f"Не удалось выполнить действие: {action_name}")
+
+
+def handle_test_command(
+    account: Account, connection: sqlite3.Connection, message
+) -> None:
+    if not TEST_ALLOWED_USER or not TEST_COMMAND:
+        return
+
+    author = (message.author or message.chat_name or "").strip()
+    if author.casefold() != TEST_ALLOWED_USER.casefold():
+        return
+    if (message.text or "").strip() != TEST_COMMAND:
+        return
+    if was_test_message_processed(connection, message.id, message.chat_id):
+        return
+
+    text = TEST_REPLY_MESSAGE.format(buyer=author)
+    send_with_retries(
+        "ответ на тестовую команду",
+        lambda: account.send_message(message.chat_id, text),
+    )
+    mark_test_message_processed(connection, message.id, message.chat_id)
+    logger.info("Тестовая команда обработана для %s", author)
 
 
 def handle_purchase(
@@ -210,6 +276,12 @@ def run() -> None:
     account = Account(golden_key).get()
     logger.info("Авторизация выполнена: %s", account.username)
     logger.info("Режим проверки без отправки: %s", DRY_RUN)
+    if TEST_ALLOWED_USER and TEST_COMMAND:
+        logger.info("Тестовая команда включена для %s", TEST_ALLOWED_USER)
+    elif TEST_ALLOWED_USER or TEST_COMMAND:
+        logger.warning(
+            "Тестовая команда отключена: нужны TEST_ALLOWED_USER и TEST_COMMAND"
+        )
 
     runner = Runner(account)
     confirmed_types = {enums.MessageTypes.ORDER_CONFIRMED}
@@ -232,6 +304,10 @@ def run() -> None:
 
         message = event.message
         if message.author_id != 0:
+            try:
+                handle_test_command(account, connection, message)
+            except Exception:
+                logger.exception("Не удалось обработать тестовую команду")
             continue
 
         order_id = extract_order_id(message.text)
