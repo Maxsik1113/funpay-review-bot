@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 import unicodedata
 from pathlib import Path
@@ -23,6 +24,7 @@ SEND_REVIEW_IMAGE = os.getenv("SEND_REVIEW_IMAGE", "true").lower() in {
 }
 TEST_ALLOWED_USER = os.getenv("TEST_ALLOWED_USER", "").strip()
 TEST_COMMAND = os.getenv("TEST_COMMAND", "").strip()
+TEST_POLL_DELAY = max(3.0, float(os.getenv("TEST_POLL_DELAY", "5")))
 
 ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = Path("/app/data") if Path("/app").exists() else ROOT_DIR / "data"
@@ -55,6 +57,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger("funpay-review-bot")
+TEST_HANDLER_LOCK = threading.Lock()
 
 
 def normalize_test_value(value: str | None) -> str:
@@ -188,15 +191,16 @@ def handle_test_input(
         return
     if normalize_test_value(text) != normalize_test_value(TEST_COMMAND):
         return
-    if was_test_message_processed(connection, message_id, chat_id):
-        return
+    with TEST_HANDLER_LOCK:
+        if was_test_message_processed(connection, message_id, chat_id):
+            return
 
-    reply = TEST_REPLY_MESSAGE.format(buyer=author)
-    send_with_retries(
-        "ответ на тестовую команду",
-        lambda: account.send_message(chat_id, reply),
-    )
-    mark_test_message_processed(connection, message_id, chat_id)
+        reply = TEST_REPLY_MESSAGE.format(buyer=author)
+        send_with_retries(
+            "ответ на тестовую команду",
+            lambda: account.send_message(chat_id, reply),
+        )
+        mark_test_message_processed(connection, message_id, chat_id)
     logger.info("Тестовая команда обработана для %s", author)
 
 
@@ -228,7 +232,9 @@ def handle_test_chat_update(
     )
 
 
-def scan_test_chat(account: Account, connection: sqlite3.Connection) -> None:
+def scan_test_chat(
+    account: Account, connection: sqlite3.Connection, log_status: bool = True
+) -> None:
     if not TEST_ALLOWED_USER or not TEST_COMMAND:
         return
 
@@ -243,23 +249,43 @@ def scan_test_chat(account: Account, connection: sqlite3.Connection) -> None:
         None,
     )
     if target is None:
-        logger.warning(
-            "Тестовый чат с %s не найден среди %s последних чатов",
-            TEST_ALLOWED_USER,
-            len(chats),
-        )
+        if log_status:
+            logger.warning(
+                "Тестовый чат с %s не найден среди %s последних чатов",
+                TEST_ALLOWED_USER,
+                len(chats),
+            )
         return
 
     account.add_chats([target])
     command_matches = normalize_test_value(
         target.last_message_text
     ) == normalize_test_value(TEST_COMMAND)
-    logger.info(
-        "Тестовый чат найден: %s; последняя команда совпадает: %s",
-        TEST_ALLOWED_USER,
-        command_matches,
-    )
+    if log_status:
+        logger.info(
+            "Тестовый чат найден: %s; последняя команда совпадает: %s",
+            TEST_ALLOWED_USER,
+            command_matches,
+        )
     handle_test_chat_update(account, connection, target)
+
+
+def watch_test_chat(golden_key: str, stop_event: threading.Event) -> None:
+    connection = init_database()
+    try:
+        account = Account(golden_key).get()
+        logger.info(
+            "Непрерывная проверка тестового чата запущена: интервал %.0f сек.",
+            TEST_POLL_DELAY,
+        )
+        while not stop_event.is_set():
+            try:
+                scan_test_chat(account, connection, log_status=False)
+            except Exception:
+                logger.exception("Ошибка фоновой проверки тестового чата")
+            stop_event.wait(TEST_POLL_DELAY)
+    finally:
+        connection.close()
 
 
 def handle_purchase(
@@ -360,6 +386,17 @@ def run() -> None:
         )
 
     runner = Runner(account)
+    test_watcher_stop = None
+    test_watcher = None
+    if TEST_ALLOWED_USER and TEST_COMMAND:
+        test_watcher_stop = threading.Event()
+        test_watcher = threading.Thread(
+            target=watch_test_chat,
+            args=(golden_key, test_watcher_stop),
+            name="test-chat-watcher",
+            daemon=True,
+        )
+        test_watcher.start()
     confirmed_types = {enums.MessageTypes.ORDER_CONFIRMED}
     confirmed_by_admin = getattr(
         enums.MessageTypes, "ORDER_CONFIRMED_BY_ADMIN", None
@@ -369,46 +406,53 @@ def run() -> None:
 
     last_session_refresh = time.monotonic()
 
-    for event in runner.listen(requests_delay=POLL_DELAY):
-        if time.monotonic() - last_session_refresh >= 45 * 60:
-            account.get()
-            last_session_refresh = time.monotonic()
-            logger.info("Сессия FunPay обновлена")
+    try:
+        for event in runner.listen(requests_delay=POLL_DELAY):
+            if time.monotonic() - last_session_refresh >= 45 * 60:
+                account.get()
+                last_session_refresh = time.monotonic()
+                logger.info("Сессия FunPay обновлена")
 
-        if event.type in {
-            enums.EventTypes.INITIAL_CHAT,
-            enums.EventTypes.LAST_CHAT_MESSAGE_CHANGED,
-        }:
+            if event.type in {
+                enums.EventTypes.INITIAL_CHAT,
+                enums.EventTypes.LAST_CHAT_MESSAGE_CHANGED,
+            }:
+                try:
+                    handle_test_chat_update(account, connection, event.chat)
+                except Exception:
+                    logger.exception("Не удалось обработать обновление тестового чата")
+                continue
+
+            if event.type is not enums.EventTypes.NEW_MESSAGE:
+                continue
+
+            message = event.message
+            if message.author_id != 0:
+                try:
+                    handle_test_command(account, connection, message)
+                except Exception:
+                    logger.exception("Не удалось обработать тестовую команду")
+                continue
+
+            order_id = extract_order_id(message.text)
+            if not order_id:
+                continue
+
+            buyer = message.chat_name or "покупатель"
+
             try:
-                handle_test_chat_update(account, connection, event.chat)
+                if message.type is enums.MessageTypes.ORDER_PURCHASED:
+                    handle_purchase(account, connection, message, order_id, buyer)
+                elif message.type in confirmed_types:
+                    handle_confirmation(account, connection, message, order_id, buyer)
             except Exception:
-                logger.exception("Не удалось обработать обновление тестового чата")
-            continue
-
-        if event.type is not enums.EventTypes.NEW_MESSAGE:
-            continue
-
-        message = event.message
-        if message.author_id != 0:
-            try:
-                handle_test_command(account, connection, message)
-            except Exception:
-                logger.exception("Не удалось обработать тестовую команду")
-            continue
-
-        order_id = extract_order_id(message.text)
-        if not order_id:
-            continue
-
-        buyer = message.chat_name or "покупатель"
-
-        try:
-            if message.type is enums.MessageTypes.ORDER_PURCHASED:
-                handle_purchase(account, connection, message, order_id, buyer)
-            elif message.type in confirmed_types:
-                handle_confirmation(account, connection, message, order_id, buyer)
-        except Exception:
-            logger.exception("Не удалось обработать заказ #%s", order_id)
+                logger.exception("Не удалось обработать заказ #%s", order_id)
+    finally:
+        if test_watcher_stop is not None:
+            test_watcher_stop.set()
+        if test_watcher is not None:
+            test_watcher.join(timeout=2)
+        connection.close()
 
 
 def main() -> None:
