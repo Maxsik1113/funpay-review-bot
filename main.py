@@ -381,7 +381,12 @@ def run() -> None:
     try:
         account = Account(golden_key).get()
         logger.info("Авторизация выполнена: %s", account.username)
-        logger.info("Режим проверки без отправки: %s", DRY_RUN)
+        if DRY_RUN:
+            logger.warning(
+                "DRY_RUN включён: бот обнаруживает заказы, но ничего не отправляет"
+            )
+        else:
+            logger.info("Автовыдача включена")
         if product_rules:
             logger.info("Загружено товаров: %s", len(product_rules))
         elif DOWNLOAD_URL:
@@ -403,11 +408,32 @@ def run() -> None:
                 logger.info("Сессия FunPay обновлена")
 
             if event.type in {
+                enums.EventTypes.INITIAL_ORDER,
                 enums.EventTypes.NEW_ORDER,
                 enums.EventTypes.ORDER_STATUS_CHANGED,
             }:
+                logger.info(
+                    "Получено событие заказа: type=%s, order=#%s, status=%s",
+                    event.type.name,
+                    event.order.id,
+                    event.order.status.name,
+                )
                 try:
-                    process_order_event(account, connection, event.order, product_rules)
+                    if event.type is enums.EventTypes.INITIAL_ORDER:
+                        # При перезапуске выдаём только активные оплаченные заказы.
+                        # Закрытые заказы не трогаем, чтобы не писать старым покупателям.
+                        if event.order.status is enums.OrderStatuses.PAID:
+                            handle_purchase(
+                                account,
+                                connection,
+                                event.order.id,
+                                event.order.buyer_username or "покупатель",
+                                event.order.chat_id,
+                                product_rules,
+                                event.order.description,
+                            )
+                    else:
+                        process_order_event(account, connection, event.order, product_rules)
                 except Exception:
                     logger.exception("Не удалось обработать заказ #%s", event.order.id)
                 continue
