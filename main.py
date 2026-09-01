@@ -1,30 +1,29 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import sqlite3
-import threading
 import time
 import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
 
 from FunPayAPI import Account, Runner, enums
 
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-POLL_DELAY = float(os.getenv("POLL_DELAY", "6"))
+POLL_DELAY = max(3.0, float(os.getenv("POLL_DELAY", "6")))
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes", "on"}
 DOWNLOAD_URL = os.getenv("DOWNLOAD_URL", "").strip()
+PRODUCTS_JSON = os.getenv("PRODUCTS_JSON", "").strip()
 SEND_REVIEW_IMAGE = os.getenv("SEND_REVIEW_IMAGE", "true").lower() in {
     "1",
     "true",
     "yes",
     "on",
 }
-TEST_ALLOWED_USER = os.getenv("TEST_ALLOWED_USER", "").strip()
-TEST_COMMAND = os.getenv("TEST_COMMAND", "").strip()
-TEST_POLL_DELAY = max(3.0, float(os.getenv("TEST_POLL_DELAY", "5")))
 
 ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = Path("/app/data") if Path("/app").exists() else ROOT_DIR / "data"
@@ -34,9 +33,9 @@ REVIEW_IMAGE_PATH = Path(os.getenv("REVIEW_IMAGE_PATH", str(ROOT_DIR / "review.p
 
 ORDER_ID_PATTERN = re.compile(r"#([A-Za-z0-9]+)")
 
-DEFAULT_DELIVERY_MESSAGE = """📦 {buyer}, спасибо за покупку!
+DEFAULT_DELIVERY_MESSAGE = """📦 {buyer}, спасибо за покупку «{product}»!
 
-Скачать мод можно по ссылке:
+Скачать товар можно по ссылке:
 {download_url}
 
 Если появятся вопросы, напишите мне в этом чате."""
@@ -47,21 +46,66 @@ DEFAULT_REVIEW_MESSAGE = """⭐ {buyer}, спасибо за подтвержд�
 Оставить его можно на странице заказа:
 https://funpay.com/orders/{order_id}/"""
 
-TEST_REPLY_MESSAGE = """✅ {buyer}, тестовая команда получена.
-
-Бот видит входящие сообщения и умеет отвечать. Автовыдача, ссылка на товар и запрос отзыва не запускались."""
-
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger("funpay-review-bot")
-TEST_HANDLER_LOCK = threading.Lock()
 
 
-def normalize_test_value(value: str | None) -> str:
+@dataclass(frozen=True)
+class ProductRule:
+    marker: str
+    name: str
+    download_url: str
+
+
+def normalize(value: str | None) -> str:
     return unicodedata.normalize("NFKC", value or "").strip().casefold()
+
+
+def load_product_rules(raw: str) -> list[ProductRule]:
+    if not raw:
+        return []
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"PRODUCTS_JSON содержит ошибку JSON: {exc}") from exc
+
+    if not isinstance(data, dict) or not data:
+        raise RuntimeError("PRODUCTS_JSON должен быть непустым JSON-объектом")
+
+    rules = []
+    for marker, config in data.items():
+        marker = str(marker).strip()
+        if isinstance(config, str):
+            name = marker
+            download_url = config.strip()
+        elif isinstance(config, dict):
+            name = str(config.get("name") or marker).strip()
+            download_url = str(config.get("url") or "").strip()
+        else:
+            raise RuntimeError(
+                f"Товар {marker!r} в PRODUCTS_JSON должен быть ссылкой или объектом"
+            )
+
+        if not marker or not download_url:
+            raise RuntimeError("Каждому товару в PRODUCTS_JSON нужны маркер и url")
+        rules.append(ProductRule(marker, name, download_url))
+    return rules
+
+
+def select_product(description: str, rules: list[ProductRule]) -> ProductRule | None:
+    normalized_description = normalize(description)
+    matches = [rule for rule in rules if normalize(rule.marker) in normalized_description]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        names = ", ".join(rule.marker for rule in matches)
+        raise RuntimeError(f"В описании заказа найдено несколько маркеров: {names}")
+    return None
 
 
 def read_template(filename: str, fallback: str) -> str:
@@ -82,16 +126,6 @@ def init_database() -> sqlite3.Connection:
             event_name TEXT NOT NULL,
             buyer TEXT NOT NULL,
             processed_at INTEGER NOT NULL
-        )
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS processed_test_messages (
-            message_id INTEGER NOT NULL,
-            chat_id TEXT NOT NULL,
-            processed_at INTEGER NOT NULL,
-            PRIMARY KEY (message_id, chat_id)
         )
         """
     )
@@ -124,33 +158,6 @@ def mark_processed(
     connection.commit()
 
 
-def was_test_message_processed(
-    connection: sqlite3.Connection, message_id: int, chat_id: int | str
-) -> bool:
-    row = connection.execute(
-        """
-        SELECT 1 FROM processed_test_messages
-        WHERE message_id = ? AND chat_id = ?
-        """,
-        (message_id, str(chat_id)),
-    ).fetchone()
-    return row is not None
-
-
-def mark_test_message_processed(
-    connection: sqlite3.Connection, message_id: int, chat_id: int | str
-) -> None:
-    connection.execute(
-        """
-        INSERT OR IGNORE INTO processed_test_messages
-            (message_id, chat_id, processed_at)
-        VALUES (?, ?, ?)
-        """,
-        (message_id, str(chat_id), int(time.time())),
-    )
-    connection.commit()
-
-
 def extract_order_id(text: str | None) -> str | None:
     if not text:
         return None
@@ -175,161 +182,82 @@ def send_with_retries(action_name: str, action, attempts: int = 3) -> None:
     raise RuntimeError(f"Не удалось выполнить действие: {action_name}")
 
 
-def handle_test_input(
+def get_delivery_product(
     account: Account,
-    connection: sqlite3.Connection,
-    author: str,
-    text: str | None,
-    message_id: int,
-    chat_id: int | str,
-) -> None:
-    if not TEST_ALLOWED_USER or not TEST_COMMAND:
-        return
+    order_id: str,
+    product_rules: list[ProductRule],
+    description: str | None = None,
+) -> tuple[str, str] | None:
+    if not product_rules:
+        return ("товар", DOWNLOAD_URL) if DOWNLOAD_URL else None
 
-    author = author.strip()
-    if normalize_test_value(author) != normalize_test_value(TEST_ALLOWED_USER):
-        return
-    if normalize_test_value(text) != normalize_test_value(TEST_COMMAND):
-        return
-    with TEST_HANDLER_LOCK:
-        if was_test_message_processed(connection, message_id, chat_id):
-            return
+    if description is None:
+        description = account.get_order_shortcut(order_id).description
 
-        reply = TEST_REPLY_MESSAGE.format(buyer=author)
-        send_with_retries(
-            "ответ на тестовую команду",
-            lambda: account.send_message(chat_id, reply),
+    product = select_product(description, product_rules)
+    if product is None:
+        logger.error(
+            "Заказ #%s не выдан: в описании нет маркера из PRODUCTS_JSON",
+            order_id,
         )
-        mark_test_message_processed(connection, message_id, chat_id)
-    logger.info("Тестовая команда обработана для %s", author)
-
-
-def handle_test_command(
-    account: Account, connection: sqlite3.Connection, message
-) -> None:
-    handle_test_input(
-        account,
-        connection,
-        message.author or message.chat_name or "",
-        message.text,
-        message.id,
-        message.chat_id,
-    )
-
-
-def handle_test_chat_update(
-    account: Account, connection: sqlite3.Connection, chat
-) -> None:
-    if chat.last_by_bot or chat.last_by_vertex:
-        return
-    handle_test_input(
-        account,
-        connection,
-        chat.name or "",
-        chat.last_message_text,
-        chat.node_msg_id,
-        chat.id,
-    )
-
-
-def scan_test_chat(
-    account: Account, connection: sqlite3.Connection, log_status: bool = True
-) -> None:
-    if not TEST_ALLOWED_USER or not TEST_COMMAND:
-        return
-
-    chats = account.request_chats()
-    target = next(
-        (
-            chat
-            for chat in chats
-            if normalize_test_value(chat.name)
-            == normalize_test_value(TEST_ALLOWED_USER)
-        ),
-        None,
-    )
-    if target is None:
-        if log_status:
-            logger.warning(
-                "Тестовый чат с %s не найден среди %s последних чатов",
-                TEST_ALLOWED_USER,
-                len(chats),
-            )
-        return
-
-    account.add_chats([target])
-    command_matches = normalize_test_value(
-        target.last_message_text
-    ) == normalize_test_value(TEST_COMMAND)
-    if log_status:
-        logger.info(
-            "Тестовый чат найден: %s; последняя команда совпадает: %s",
-            TEST_ALLOWED_USER,
-            command_matches,
-        )
-    handle_test_chat_update(account, connection, target)
-
-
-def watch_test_chat(golden_key: str, stop_event: threading.Event) -> None:
-    connection = init_database()
-    try:
-        account = Account(golden_key).get()
-        logger.info(
-            "Непрерывная проверка тестового чата запущена: интервал %.0f сек.",
-            TEST_POLL_DELAY,
-        )
-        while not stop_event.is_set():
-            try:
-                scan_test_chat(account, connection, log_status=False)
-            except Exception:
-                logger.exception("Ошибка фоновой проверки тестового чата")
-            stop_event.wait(TEST_POLL_DELAY)
-    finally:
-        connection.close()
+        return None
+    return product.name, product.download_url
 
 
 def handle_purchase(
     account: Account,
     connection: sqlite3.Connection,
-    message,
     order_id: str,
     buyer: str,
+    chat_id: int | str,
+    product_rules: list[ProductRule],
+    description: str | None = None,
 ) -> None:
-    if not DOWNLOAD_URL:
-        logger.info(
-            "Заказ #%s оплачен, но DOWNLOAD_URL не задан — автовыдача пропущена",
-            order_id,
-        )
-        return
-
     event_key = f"purchase:{order_id}"
     if was_processed(connection, event_key):
         return
 
+    delivery = get_delivery_product(account, order_id, product_rules, description)
+    if delivery is None:
+        logger.error("Заказ #%s требует ручной выдачи", order_id)
+        return
+
+    product_name, download_url = delivery
     text = read_template("delivery_message.txt", DEFAULT_DELIVERY_MESSAGE).format(
         buyer=buyer,
         order_id=order_id,
-        download_url=DOWNLOAD_URL,
+        product=product_name,
+        download_url=download_url,
     )
 
     if DRY_RUN:
-        logger.info("DRY_RUN: автовыдача для %s, заказ #%s", buyer, order_id)
+        logger.info(
+            "DRY_RUN: автовыдача «%s» для %s, заказ #%s",
+            product_name,
+            buyer,
+            order_id,
+        )
         return
 
     send_with_retries(
         f"автовыдача заказа #{order_id}",
-        lambda: account.send_message(message.chat_id, text),
+        lambda: account.send_message(chat_id, text),
     )
     mark_processed(connection, event_key, order_id, "purchase", buyer)
-    logger.info("Ссылка на товар отправлена %s по заказу #%s", buyer, order_id)
+    logger.info(
+        "Товар «%s» отправлен %s по заказу #%s",
+        product_name,
+        buyer,
+        order_id,
+    )
 
 
 def handle_confirmation(
     account: Account,
     connection: sqlite3.Connection,
-    message,
     order_id: str,
     buyer: str,
+    chat_id: int | str,
 ) -> None:
     event_key = f"confirmation:{order_id}"
     if was_processed(connection, event_key):
@@ -339,6 +267,7 @@ def handle_confirmation(
         buyer=buyer,
         order_id=order_id,
         download_url=DOWNLOAD_URL,
+        product="товар",
     )
 
     if DRY_RUN:
@@ -347,22 +276,46 @@ def handle_confirmation(
 
     send_with_retries(
         f"сообщение после подтверждения заказа #{order_id}",
-        lambda: account.send_message(message.chat_id, text),
+        lambda: account.send_message(chat_id, text),
     )
 
     if SEND_REVIEW_IMAGE:
         if REVIEW_IMAGE_PATH.exists():
             send_with_retries(
                 f"картинка после подтверждения заказа #{order_id}",
-                lambda: account.send_image(message.chat_id, str(REVIEW_IMAGE_PATH)),
+                lambda: account.send_image(chat_id, str(REVIEW_IMAGE_PATH)),
             )
         else:
-            logger.warning(
-                "Картинка %s не найдена — отправлен только текст", REVIEW_IMAGE_PATH
-            )
+            logger.warning("Картинка %s не найдена — отправлен только текст", REVIEW_IMAGE_PATH)
 
     mark_processed(connection, event_key, order_id, "confirmation", buyer)
     logger.info("Благодарность отправлена %s по заказу #%s", buyer, order_id)
+
+
+def process_order_event(
+    account: Account,
+    connection: sqlite3.Connection,
+    order,
+    product_rules: list[ProductRule],
+) -> None:
+    if order.status in {enums.OrderStatuses.PAID, enums.OrderStatuses.CLOSED}:
+        handle_purchase(
+            account,
+            connection,
+            order.id,
+            order.buyer_username or "покупатель",
+            order.chat_id,
+            product_rules,
+            order.description,
+        )
+    if order.status is enums.OrderStatuses.CLOSED:
+        handle_confirmation(
+            account,
+            connection,
+            order.id,
+            order.buyer_username or "покупатель",
+            order.chat_id,
+        )
 
 
 def run() -> None:
@@ -370,43 +323,26 @@ def run() -> None:
     if not golden_key:
         raise RuntimeError("Не задана переменная окружения FUNPAY_GOLDEN_KEY")
 
+    product_rules = load_product_rules(PRODUCTS_JSON)
     connection = init_database()
-    account = Account(golden_key).get()
-    logger.info("Авторизация выполнена: %s", account.username)
-    logger.info("Режим проверки без отправки: %s", DRY_RUN)
-    if TEST_ALLOWED_USER and TEST_COMMAND:
-        logger.info("Тестовая команда включена для %s", TEST_ALLOWED_USER)
-        try:
-            scan_test_chat(account, connection)
-        except Exception:
-            logger.exception("Не удалось проверить тестовый чат при запуске")
-    elif TEST_ALLOWED_USER or TEST_COMMAND:
-        logger.warning(
-            "Тестовая команда отключена: нужны TEST_ALLOWED_USER и TEST_COMMAND"
-        )
-
-    runner = Runner(account)
-    test_watcher_stop = None
-    test_watcher = None
-    if TEST_ALLOWED_USER and TEST_COMMAND:
-        test_watcher_stop = threading.Event()
-        test_watcher = threading.Thread(
-            target=watch_test_chat,
-            args=(golden_key, test_watcher_stop),
-            name="test-chat-watcher",
-            daemon=True,
-        )
-        test_watcher.start()
-    confirmed_types = {enums.MessageTypes.ORDER_CONFIRMED}
-    confirmed_by_admin = getattr(
-        enums.MessageTypes, "ORDER_CONFIRMED_BY_ADMIN", None
-    )
-    if confirmed_by_admin is not None:
-        confirmed_types.add(confirmed_by_admin)
-
-    last_session_refresh = time.monotonic()
-
     try:
+        account = Account(golden_key).get()
+        logger.info("Авторизация выполнена: %s", account.username)
+        logger.info("Режим проверки без отправки: %s", DRY_RUN)
+        if product_rules:
+            logger.info("Загружено товаров: %s", len(product_rules))
+        elif DOWNLOAD_URL:
+            logger.info("Используется один товар из DOWNLOAD_URL")
+        else:
+            logger.warning("Не заданы PRODUCTS_JSON и DOWNLOAD_URL: автовыдача отключена")
+
+        runner = Runner(account)
+        confirmed_types = {enums.MessageTypes.ORDER_CONFIRMED}
+        confirmed_by_admin = getattr(enums.MessageTypes, "ORDER_CONFIRMED_BY_ADMIN", None)
+        if confirmed_by_admin is not None:
+            confirmed_types.add(confirmed_by_admin)
+
+        last_session_refresh = time.monotonic()
         for event in runner.listen(requests_delay=POLL_DELAY):
             if time.monotonic() - last_session_refresh >= 45 * 60:
                 account.get()
@@ -414,13 +350,13 @@ def run() -> None:
                 logger.info("Сессия FunPay обновлена")
 
             if event.type in {
-                enums.EventTypes.INITIAL_CHAT,
-                enums.EventTypes.LAST_CHAT_MESSAGE_CHANGED,
+                enums.EventTypes.NEW_ORDER,
+                enums.EventTypes.ORDER_STATUS_CHANGED,
             }:
                 try:
-                    handle_test_chat_update(account, connection, event.chat)
+                    process_order_event(account, connection, event.order, product_rules)
                 except Exception:
-                    logger.exception("Не удалось обработать обновление тестового чата")
+                    logger.exception("Не удалось обработать заказ #%s", event.order.id)
                 continue
 
             if event.type is not enums.EventTypes.NEW_MESSAGE:
@@ -428,10 +364,6 @@ def run() -> None:
 
             message = event.message
             if message.author_id != 0:
-                try:
-                    handle_test_command(account, connection, message)
-                except Exception:
-                    logger.exception("Не удалось обработать тестовую команду")
                 continue
 
             order_id = extract_order_id(message.text)
@@ -439,19 +371,35 @@ def run() -> None:
                 continue
 
             buyer = message.chat_name or "покупатель"
-
             try:
                 if message.type is enums.MessageTypes.ORDER_PURCHASED:
-                    handle_purchase(account, connection, message, order_id, buyer)
+                    handle_purchase(
+                        account,
+                        connection,
+                        order_id,
+                        buyer,
+                        message.chat_id,
+                        product_rules,
+                    )
                 elif message.type in confirmed_types:
-                    handle_confirmation(account, connection, message, order_id, buyer)
+                    handle_purchase(
+                        account,
+                        connection,
+                        order_id,
+                        buyer,
+                        message.chat_id,
+                        product_rules,
+                    )
+                    handle_confirmation(
+                        account,
+                        connection,
+                        order_id,
+                        buyer,
+                        message.chat_id,
+                    )
             except Exception:
                 logger.exception("Не удалось обработать заказ #%s", order_id)
     finally:
-        if test_watcher_stop is not None:
-            test_watcher_stop.set()
-        if test_watcher is not None:
-            test_watcher.join(timeout=2)
         connection.close()
 
 
