@@ -95,7 +95,8 @@ logger = logging.getLogger("funpay-review-bot")
 
 @dataclass(frozen=True)
 class ProductRule:
-    marker: str
+    key: str
+    markers: tuple[str, ...]
     name: str
     download_url: str
     service: str
@@ -118,38 +119,49 @@ def load_product_rules(raw: str) -> list[ProductRule]:
         raise RuntimeError("PRODUCTS_JSON должен быть непустым JSON-объектом")
 
     rules = []
-    for marker, config in data.items():
-        marker = str(marker).strip()
+    for key, config in data.items():
+        key = str(key).strip()
         if isinstance(config, str):
-            name = marker
+            name = key
             download_url = config.strip()
             service = ""
+            markers = (key,)
         elif isinstance(config, dict):
-            name = str(config.get("name") or marker).strip()
+            name = str(config.get("name") or key).strip()
             download_url = str(config.get("url") or "").strip()
             service = str(config.get("service") or "").strip()
+            raw_markers = config.get("markers", [key])
+            if not isinstance(raw_markers, list):
+                raise RuntimeError(f"markers для {key!r} должен быть JSON-массивом")
+            markers = tuple(
+                str(item).strip() for item in raw_markers if str(item).strip()
+            )
         else:
             raise RuntimeError(
-                f"Товар {marker!r} в PRODUCTS_JSON должен быть ссылкой или объектом"
+                f"Товар {key!r} в PRODUCTS_JSON должен быть ссылкой или объектом"
             )
 
         if service and service not in SERVICE_MESSAGES:
-            raise RuntimeError(f"Неизвестный тип услуги {service!r} для {marker!r}")
-        if not marker or not (download_url or service):
+            raise RuntimeError(f"Неизвестный тип услуги {service!r} для {key!r}")
+        if not key or not markers or not (download_url or service):
             raise RuntimeError(
-                "Каждой записи PRODUCTS_JSON нужен маркер и url или service"
+                "Каждой записи PRODUCTS_JSON нужны markers и url или service"
             )
-        rules.append(ProductRule(marker, name, download_url, service))
+        rules.append(ProductRule(key, markers, name, download_url, service))
     return rules
 
 
 def select_product(description: str, rules: list[ProductRule]) -> ProductRule | None:
     normalized_description = normalize(description)
-    matches = [rule for rule in rules if normalize(rule.marker) in normalized_description]
+    matches = [
+        rule
+        for rule in rules
+        if any(normalize(marker) in normalized_description for marker in rule.markers)
+    ]
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
-        names = ", ".join(rule.marker for rule in matches)
+        names = ", ".join(rule.key for rule in matches)
         raise RuntimeError(f"В описании заказа найдено несколько маркеров: {names}")
     return None
 
@@ -235,7 +247,7 @@ def get_delivery_product(
     description: str | None = None,
 ) -> ProductRule | None:
     if not product_rules:
-        return ProductRule("", "товар", DOWNLOAD_URL, "") if DOWNLOAD_URL else None
+        return ProductRule("", ("",), "товар", DOWNLOAD_URL, "") if DOWNLOAD_URL else None
 
     if description is None:
         description = account.get_order_shortcut(order_id).description
