@@ -167,27 +167,60 @@ def send_with_retries(action_name: str, action, attempts: int = 3) -> None:
     raise RuntimeError(f"Не удалось выполнить действие: {action_name}")
 
 
-def handle_test_command(
-    account: Account, connection: sqlite3.Connection, message
+def handle_test_input(
+    account: Account,
+    connection: sqlite3.Connection,
+    author: str,
+    text: str | None,
+    message_id: int,
+    chat_id: int | str,
 ) -> None:
     if not TEST_ALLOWED_USER or not TEST_COMMAND:
         return
 
-    author = (message.author or message.chat_name or "").strip()
+    author = author.strip()
     if author.casefold() != TEST_ALLOWED_USER.casefold():
         return
-    if (message.text or "").strip() != TEST_COMMAND:
+    if (text or "").strip() != TEST_COMMAND:
         return
-    if was_test_message_processed(connection, message.id, message.chat_id):
+    if was_test_message_processed(connection, message_id, chat_id):
         return
 
-    text = TEST_REPLY_MESSAGE.format(buyer=author)
+    reply = TEST_REPLY_MESSAGE.format(buyer=author)
     send_with_retries(
         "ответ на тестовую команду",
-        lambda: account.send_message(message.chat_id, text),
+        lambda: account.send_message(chat_id, reply),
     )
-    mark_test_message_processed(connection, message.id, message.chat_id)
+    mark_test_message_processed(connection, message_id, chat_id)
     logger.info("Тестовая команда обработана для %s", author)
+
+
+def handle_test_command(
+    account: Account, connection: sqlite3.Connection, message
+) -> None:
+    handle_test_input(
+        account,
+        connection,
+        message.author or message.chat_name or "",
+        message.text,
+        message.id,
+        message.chat_id,
+    )
+
+
+def handle_test_chat_update(
+    account: Account, connection: sqlite3.Connection, chat
+) -> None:
+    if chat.last_by_bot or chat.last_by_vertex:
+        return
+    handle_test_input(
+        account,
+        connection,
+        chat.name or "",
+        chat.last_message_text,
+        chat.node_msg_id,
+        chat.id,
+    )
 
 
 def handle_purchase(
@@ -298,6 +331,16 @@ def run() -> None:
             account.get()
             last_session_refresh = time.monotonic()
             logger.info("Сессия FunPay обновлена")
+
+        if event.type in {
+            enums.EventTypes.INITIAL_CHAT,
+            enums.EventTypes.LAST_CHAT_MESSAGE_CHANGED,
+        }:
+            try:
+                handle_test_chat_update(account, connection, event.chat)
+            except Exception:
+                logger.exception("Не удалось обработать обновление тестового чата")
+            continue
 
         if event.type is not enums.EventTypes.NEW_MESSAGE:
             continue

@@ -74,6 +74,45 @@ class TestCommandTests(unittest.TestCase):
 
         self.assertEqual(account.sent, [])
 
+    def test_chat_update_fallback_handles_command(self):
+        account = FakeAccount()
+        connection = make_connection()
+        chat = SimpleNamespace(
+            id=123,
+            name="TestBuyer",
+            last_message_text="!secret-check",
+            node_msg_id=7,
+            last_by_bot=False,
+            last_by_vertex=False,
+        )
+
+        with patch.object(main, "TEST_ALLOWED_USER", "TestBuyer"), patch.object(
+            main, "TEST_COMMAND", "!secret-check"
+        ):
+            main.handle_test_chat_update(account, connection, chat)
+            main.handle_test_chat_update(account, connection, chat)
+
+        self.assertEqual(len(account.sent), 1)
+
+    def test_chat_update_ignores_bot_message(self):
+        account = FakeAccount()
+        connection = make_connection()
+        chat = SimpleNamespace(
+            id=123,
+            name="TestBuyer",
+            last_message_text="!secret-check",
+            node_msg_id=8,
+            last_by_bot=True,
+            last_by_vertex=False,
+        )
+
+        with patch.object(main, "TEST_ALLOWED_USER", "TestBuyer"), patch.object(
+            main, "TEST_COMMAND", "!secret-check"
+        ):
+            main.handle_test_chat_update(account, connection, chat)
+
+        self.assertEqual(account.sent, [])
+
 
 if __name__ == "__main__":
     unittest.main()
