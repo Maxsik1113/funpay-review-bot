@@ -243,8 +243,10 @@ def get_delivery_product(
     product = select_product(description, product_rules)
     if product is None:
         logger.error(
-            "Заказ #%s не выдан: в описании нет маркера из PRODUCTS_JSON",
+            "Заказ #%s не выдан: в описании нет маркера из PRODUCTS_JSON. "
+            "Описание заказа: %r",
             order_id,
+            description[:300],
         )
         return None
     return product
@@ -258,15 +260,14 @@ def handle_purchase(
     chat_id: int | str,
     product_rules: list[ProductRule],
     description: str | None = None,
-) -> None:
+) -> bool:
     event_key = f"purchase:{order_id}"
     if was_processed(connection, event_key):
-        return
+        return True
 
     delivery = get_delivery_product(account, order_id, product_rules, description)
     if delivery is None:
-        logger.error("Заказ #%s требует ручной выдачи", order_id)
-        return
+        return False
 
     if delivery.service:
         text = SERVICE_MESSAGES[delivery.service].format(
@@ -290,7 +291,7 @@ def handle_purchase(
             buyer,
             order_id,
         )
-        return
+        return True
 
     send_with_retries(
         f"автовыдача заказа #{order_id}",
@@ -303,6 +304,7 @@ def handle_purchase(
         buyer,
         order_id,
     )
+    return True
 
 
 def handle_confirmation(
@@ -396,6 +398,7 @@ def run() -> None:
 
         last_session_refresh = time.monotonic()
         last_sales_summary: tuple[int, int] | None = None
+        unmatched_orders: set[str] = set()
         logger.info("Запущена прямая проверка продаж каждые %.0f сек.", POLL_DELAY)
 
         while True:
@@ -431,7 +434,9 @@ def run() -> None:
             for order in sales:
                 try:
                     if order.status is enums.OrderStatuses.PAID:
-                        handle_purchase(
+                        if order.id in unmatched_orders:
+                            continue
+                        matched = handle_purchase(
                             account,
                             connection,
                             order.id,
@@ -440,6 +445,8 @@ def run() -> None:
                             product_rules,
                             order.description,
                         )
+                        if not matched:
+                            unmatched_orders.add(order.id)
                     elif (
                         order.status is enums.OrderStatuses.CLOSED
                         and was_processed(connection, f"purchase:{order.id}")
