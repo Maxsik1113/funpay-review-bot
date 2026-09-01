@@ -10,7 +10,7 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
-from FunPayAPI import Account, Runner, enums, exceptions
+from FunPayAPI import Account, enums, exceptions
 
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -394,90 +394,67 @@ def run() -> None:
         else:
             logger.warning("Не заданы PRODUCTS_JSON и DOWNLOAD_URL: автовыдача отключена")
 
-        runner = Runner(account)
-        confirmed_types = {enums.MessageTypes.ORDER_CONFIRMED}
-        confirmed_by_admin = getattr(enums.MessageTypes, "ORDER_CONFIRMED_BY_ADMIN", None)
-        if confirmed_by_admin is not None:
-            confirmed_types.add(confirmed_by_admin)
-
         last_session_refresh = time.monotonic()
-        for event in runner.listen(requests_delay=POLL_DELAY):
+        last_sales_summary: tuple[int, int] | None = None
+        logger.info("Запущена прямая проверка продаж каждые %.0f сек.", POLL_DELAY)
+
+        while True:
             if time.monotonic() - last_session_refresh >= 45 * 60:
                 account.get()
                 last_session_refresh = time.monotonic()
                 logger.info("Сессия FunPay обновлена")
 
-            if event.type in {
-                enums.EventTypes.INITIAL_ORDER,
-                enums.EventTypes.NEW_ORDER,
-                enums.EventTypes.ORDER_STATUS_CHANGED,
-            }:
-                logger.info(
-                    "Получено событие заказа: type=%s, order=#%s, status=%s",
-                    event.type.name,
-                    event.order.id,
-                    event.order.status.name,
-                )
-                try:
-                    if event.type is enums.EventTypes.INITIAL_ORDER:
-                        # При перезапуске выдаём только активные оплаченные заказы.
-                        # Закрытые заказы не трогаем, чтобы не писать старым покупателям.
-                        if event.order.status is enums.OrderStatuses.PAID:
-                            handle_purchase(
-                                account,
-                                connection,
-                                event.order.id,
-                                event.order.buyer_username or "покупатель",
-                                event.order.chat_id,
-                                product_rules,
-                                event.order.description,
-                            )
-                    else:
-                        process_order_event(account, connection, event.order, product_rules)
-                except Exception:
-                    logger.exception("Не удалось обработать заказ #%s", event.order.id)
-                continue
-
-            if event.type is not enums.EventTypes.NEW_MESSAGE:
-                continue
-
-            message = event.message
-            if message.author_id != 0:
-                continue
-
-            order_id = extract_order_id(message.text)
-            if not order_id:
-                continue
-
-            buyer = message.chat_name or "покупатель"
             try:
-                if message.type is enums.MessageTypes.ORDER_PURCHASED:
-                    handle_purchase(
-                        account,
-                        connection,
-                        order_id,
-                        buyer,
-                        message.chat_id,
-                        product_rules,
-                    )
-                elif message.type in confirmed_types:
-                    handle_purchase(
-                        account,
-                        connection,
-                        order_id,
-                        buyer,
-                        message.chat_id,
-                        product_rules,
-                    )
-                    handle_confirmation(
-                        account,
-                        connection,
-                        order_id,
-                        buyer,
-                        message.chat_id,
-                    )
+                sales = account.get_sales(include_refunded=False)[1]
+            except exceptions.UnauthorizedError:
+                raise
             except Exception:
-                logger.exception("Не удалось обработать заказ #%s", order_id)
+                logger.exception(
+                    "Не удалось проверить страницу «Мои продажи»; повтор через %.0f сек.",
+                    POLL_DELAY,
+                )
+                time.sleep(POLL_DELAY)
+                continue
+
+            paid_count = sum(
+                order.status is enums.OrderStatuses.PAID for order in sales
+            )
+            sales_summary = (len(sales), paid_count)
+            if sales_summary != last_sales_summary:
+                logger.info(
+                    "Проверка продаж: найдено заказов — %s, активных оплаченных — %s",
+                    len(sales),
+                    paid_count,
+                )
+                last_sales_summary = sales_summary
+
+            for order in sales:
+                try:
+                    if order.status is enums.OrderStatuses.PAID:
+                        handle_purchase(
+                            account,
+                            connection,
+                            order.id,
+                            order.buyer_username or "покупатель",
+                            order.chat_id,
+                            product_rules,
+                            order.description,
+                        )
+                    elif (
+                        order.status is enums.OrderStatuses.CLOSED
+                        and was_processed(connection, f"purchase:{order.id}")
+                    ):
+                        handle_confirmation(
+                            account,
+                            connection,
+                            order.id,
+                            order.buyer_username or "покупатель",
+                            order.chat_id,
+                        )
+                except Exception:
+                    logger.exception("Не удалось обработать заказ #%s", order.id)
+
+            time.sleep(POLL_DELAY)
     finally:
         connection.close()
 
