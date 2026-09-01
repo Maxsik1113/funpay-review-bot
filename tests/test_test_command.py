@@ -14,11 +14,18 @@ import main
 
 
 class FakeAccount:
-    def __init__(self):
+    def __init__(self, chats=None):
         self.sent = []
+        self.chats = chats or []
 
     def send_message(self, chat_id, text):
         self.sent.append((chat_id, text))
+
+    def request_chats(self):
+        return self.chats
+
+    def add_chats(self, chats):
+        return None
 
 
 def make_connection():
@@ -112,6 +119,25 @@ class TestCommandTests(unittest.TestCase):
             main.handle_test_chat_update(account, connection, chat)
 
         self.assertEqual(account.sent, [])
+
+    def test_startup_scan_handles_existing_command(self):
+        chat = SimpleNamespace(
+            id=123,
+            name="TestBuyer",
+            last_message_text="  !SECRET-CHECK  ",
+            node_msg_id=9,
+            last_by_bot=False,
+            last_by_vertex=False,
+        )
+        account = FakeAccount([chat])
+        connection = make_connection()
+
+        with patch.object(main, "TEST_ALLOWED_USER", "testbuyer"), patch.object(
+            main, "TEST_COMMAND", "!secret-check"
+        ):
+            main.scan_test_chat(account, connection)
+
+        self.assertEqual(len(account.sent), 1)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import time
+import unicodedata
 from pathlib import Path
 
 from FunPayAPI import Account, Runner, enums
@@ -54,6 +55,10 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger("funpay-review-bot")
+
+
+def normalize_test_value(value: str | None) -> str:
+    return unicodedata.normalize("NFKC", value or "").strip().casefold()
 
 
 def read_template(filename: str, fallback: str) -> str:
@@ -179,9 +184,9 @@ def handle_test_input(
         return
 
     author = author.strip()
-    if author.casefold() != TEST_ALLOWED_USER.casefold():
+    if normalize_test_value(author) != normalize_test_value(TEST_ALLOWED_USER):
         return
-    if (text or "").strip() != TEST_COMMAND:
+    if normalize_test_value(text) != normalize_test_value(TEST_COMMAND):
         return
     if was_test_message_processed(connection, message_id, chat_id):
         return
@@ -221,6 +226,40 @@ def handle_test_chat_update(
         chat.node_msg_id,
         chat.id,
     )
+
+
+def scan_test_chat(account: Account, connection: sqlite3.Connection) -> None:
+    if not TEST_ALLOWED_USER or not TEST_COMMAND:
+        return
+
+    chats = account.request_chats()
+    target = next(
+        (
+            chat
+            for chat in chats
+            if normalize_test_value(chat.name)
+            == normalize_test_value(TEST_ALLOWED_USER)
+        ),
+        None,
+    )
+    if target is None:
+        logger.warning(
+            "Тестовый чат с %s не найден среди %s последних чатов",
+            TEST_ALLOWED_USER,
+            len(chats),
+        )
+        return
+
+    account.add_chats([target])
+    command_matches = normalize_test_value(
+        target.last_message_text
+    ) == normalize_test_value(TEST_COMMAND)
+    logger.info(
+        "Тестовый чат найден: %s; последняя команда совпадает: %s",
+        TEST_ALLOWED_USER,
+        command_matches,
+    )
+    handle_test_chat_update(account, connection, target)
 
 
 def handle_purchase(
@@ -311,6 +350,10 @@ def run() -> None:
     logger.info("Режим проверки без отправки: %s", DRY_RUN)
     if TEST_ALLOWED_USER and TEST_COMMAND:
         logger.info("Тестовая команда включена для %s", TEST_ALLOWED_USER)
+        try:
+            scan_test_chat(account, connection)
+        except Exception:
+            logger.exception("Не удалось проверить тестовый чат при запуске")
     elif TEST_ALLOWED_USER or TEST_COMMAND:
         logger.warning(
             "Тестовая команда отключена: нужны TEST_ALLOWED_USER и TEST_COMMAND"
