@@ -46,6 +46,44 @@ DEFAULT_REVIEW_MESSAGE = """⭐ {buyer}, спасибо за подтвержд�
 Оставить его можно на странице заказа:
 https://funpay.com/orders/{order_id}/"""
 
+SERVICE_MESSAGES = {
+    "custom_mod": """🛠️ {buyer}, спасибо за заказ «{product}»!
+
+Чтобы я мог оценить и начать работу, ответьте, пожалуйста:
+1. Какая версия Minecraft?
+2. Какой загрузчик: Forge, Fabric или NeoForge?
+3. Мод должен работать на клиенте, сервере или обеих сторонах?
+4. Подробно опишите нужный функционал.
+5. Есть ли примеры, референсы или готовое ТЗ?
+6. Какой желаемый срок?""",
+    "plugin": """🧩 {buyer}, спасибо за заказ «{product}»!
+
+Пришлите, пожалуйста:
+1. Версию Minecraft.
+2. Ядро сервера: Paper, Spigot, Bukkit или Purpur.
+3. Подробное описание команд, механик и GUI.
+4. Нужные права, плейсхолдеры и интеграции.
+5. Нужна ли база данных?
+6. Желаемый срок.""",
+    "translation": """🌐 {buyer}, спасибо за заказ «{product}»!
+
+Для начала работы укажите:
+1. Название и версию мода или плагина.
+2. Исходный и требуемый язык.
+3. Количество файлов или примерный объём.
+4. Нужно ли сохранить цвета, эмодзи и фирменный стиль.
+5. Прикрепите файлы для перевода.
+6. Укажите желаемый срок.""",
+    "crash_report": """🔍 {buyer}, спасибо за заказ «{product}»!
+
+Для диагностики пришлите:
+1. Версию Minecraft.
+2. Загрузчик и его версию.
+3. Полный crash-report или latest.log файлом.
+4. На каком этапе происходит вылет?
+5. Что изменилось перед появлением ошибки?""",
+}
+
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -59,6 +97,7 @@ class ProductRule:
     marker: str
     name: str
     download_url: str
+    service: str
 
 
 def normalize(value: str | None) -> str:
@@ -83,17 +122,23 @@ def load_product_rules(raw: str) -> list[ProductRule]:
         if isinstance(config, str):
             name = marker
             download_url = config.strip()
+            service = ""
         elif isinstance(config, dict):
             name = str(config.get("name") or marker).strip()
             download_url = str(config.get("url") or "").strip()
+            service = str(config.get("service") or "").strip()
         else:
             raise RuntimeError(
                 f"Товар {marker!r} в PRODUCTS_JSON должен быть ссылкой или объектом"
             )
 
-        if not marker or not download_url:
-            raise RuntimeError("Каждому товару в PRODUCTS_JSON нужны маркер и url")
-        rules.append(ProductRule(marker, name, download_url))
+        if service and service not in SERVICE_MESSAGES:
+            raise RuntimeError(f"Неизвестный тип услуги {service!r} для {marker!r}")
+        if not marker or not (download_url or service):
+            raise RuntimeError(
+                "Каждой записи PRODUCTS_JSON нужен маркер и url или service"
+            )
+        rules.append(ProductRule(marker, name, download_url, service))
     return rules
 
 
@@ -187,9 +232,9 @@ def get_delivery_product(
     order_id: str,
     product_rules: list[ProductRule],
     description: str | None = None,
-) -> tuple[str, str] | None:
+) -> ProductRule | None:
     if not product_rules:
-        return ("товар", DOWNLOAD_URL) if DOWNLOAD_URL else None
+        return ProductRule("", "товар", DOWNLOAD_URL, "") if DOWNLOAD_URL else None
 
     if description is None:
         description = account.get_order_shortcut(order_id).description
@@ -201,7 +246,7 @@ def get_delivery_product(
             order_id,
         )
         return None
-    return product.name, product.download_url
+    return product
 
 
 def handle_purchase(
@@ -222,18 +267,25 @@ def handle_purchase(
         logger.error("Заказ #%s требует ручной выдачи", order_id)
         return
 
-    product_name, download_url = delivery
-    text = read_template("delivery_message.txt", DEFAULT_DELIVERY_MESSAGE).format(
-        buyer=buyer,
-        order_id=order_id,
-        product=product_name,
-        download_url=download_url,
-    )
+    if delivery.service:
+        text = SERVICE_MESSAGES[delivery.service].format(
+            buyer=buyer,
+            order_id=order_id,
+            product=delivery.name,
+            download_url=delivery.download_url,
+        )
+    else:
+        text = read_template("delivery_message.txt", DEFAULT_DELIVERY_MESSAGE).format(
+            buyer=buyer,
+            order_id=order_id,
+            product=delivery.name,
+            download_url=delivery.download_url,
+        )
 
     if DRY_RUN:
         logger.info(
             "DRY_RUN: автовыдача «%s» для %s, заказ #%s",
-            product_name,
+            delivery.name,
             buyer,
             order_id,
         )
@@ -245,8 +297,8 @@ def handle_purchase(
     )
     mark_processed(connection, event_key, order_id, "purchase", buyer)
     logger.info(
-        "Товар «%s» отправлен %s по заказу #%s",
-        product_name,
+        "Сообщение по «%s» отправлено %s по заказу #%s",
+        delivery.name,
         buyer,
         order_id,
     )

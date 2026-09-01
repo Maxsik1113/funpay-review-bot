@@ -25,6 +25,12 @@ PRODUCTS_JSON=
 
 Бот ищет маркер в описании оплаченного заказа. Если маркер не найден или найдено несколько, бот не выдаст неправильный товар и напишет ошибку в лог.
 
+Для услуг вместо `url` укажите встроенный тип `service`: `custom_mod`, `plugin`, `translation` или `crash_report`.
+
+```json
+{"[SERVICE_CUSTOM_MOD]":{"name":"Разработка мода","service":"custom_mod"}}
+```
+
 ## Bothost
 
 ```text
